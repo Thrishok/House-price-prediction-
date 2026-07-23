@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: kronos-webui
+    env: docker
+    dockerfilePath: webui/Dockerfile
+    branch: master
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    disk:
+      sizeGb: 1
