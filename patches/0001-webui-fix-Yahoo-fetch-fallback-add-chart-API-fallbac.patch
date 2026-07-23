@@ -1,0 +1,2068 @@
+From 06a4fa61d2502521d15a68f06bfca301674f7ade Mon Sep 17 00:00:00 2001
+From: Thrishok S <129937447+Thrishok@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 08:37:49 +0000
+Subject: [PATCH] webui: fix Yahoo fetch fallback, add chart API fallback;
+ clean frontend handlers; add requests dependency
+
+---
+ webui/app.py               | 1307 ++++++++++++++++++------------------
+ webui/requirements.txt     |    2 +
+ webui/templates/index.html |  556 +++------------
+ 3 files changed, 764 insertions(+), 1101 deletions(-)
+
+diff --git a/webui/app.py b/webui/app.py
+index d240a37..d366ff0 100644
+--- a/webui/app.py
++++ b/webui/app.py
+@@ -1,17 +1,15 @@
+-import os
++import os, sys, io, base64, warnings, datetime
+ import pandas as pd
+ import numpy as np
+-import json
+-import plotly.graph_objects as go
+-import plotly.utils
++import matplotlib
++matplotlib.use('Agg')
++import matplotlib.pyplot as plt
++import matplotlib.dates as mdates
++from matplotlib.patches import Rectangle
+ from flask import Flask, render_template, request, jsonify
+ from flask_cors import CORS
+-import sys
+-import warnings
+-import datetime
+-warnings.filterwarnings('ignore')
+ 
+-# Add project root directory to path
++warnings.filterwarnings('ignore')
+ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ 
+ try:
+@@ -19,690 +17,697 @@ try:
+     MODEL_AVAILABLE = True
+ except ImportError:
+     MODEL_AVAILABLE = False
+-    print("Warning: Kronos model cannot be imported, will use simulated data for demonstration")
++
++try:
++    import akshare as ak
++    AKSHARE_AVAILABLE = True
++except ImportError:
++    AKSHARE_AVAILABLE = False
++
++try:
++    import yfinance as yf
++    YFINANCE_AVAILABLE = True
++except ImportError:
++    YFINANCE_AVAILABLE = False
+ 
+ app = Flask(__name__)
+ CORS(app)
+ 
+-# Global variables to store models
+-tokenizer = None
+-model = None
+-predictor = None
+-
+-# Available model configurations
+-AVAILABLE_MODELS = {
+-    'kronos-mini': {
+-        'name': 'Kronos-mini',
+-        'model_id': 'NeoQuasar/Kronos-mini',
+-        'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-2k',
+-        'context_length': 2048,
+-        'params': '4.1M',
+-        'description': 'Lightweight model, suitable for fast prediction'
+-    },
+-    'kronos-small': {
+-        'name': 'Kronos-small',
+-        'model_id': 'NeoQuasar/Kronos-small',
+-        'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-base',
+-        'context_length': 512,
+-        'params': '24.7M',
+-        'description': 'Small model, balanced performance and speed'
+-    },
+-    'kronos-base': {
+-        'name': 'Kronos-base',
+-        'model_id': 'NeoQuasar/Kronos-base',
+-        'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-base',
+-        'context_length': 512,
+-        'params': '102.3M',
+-        'description': 'Base model, provides better prediction quality'
+-    }
++# ── globals ──────────────────────────────────────────────────────────────────
++_tokenizer = None
++_model     = None
++_predictor = None
++
++MODELS = {
++    'kronos-mini':  {'id': 'NeoQuasar/Kronos-mini',  'tok': 'NeoQuasar/Kronos-Tokenizer-2k',   'ctx': 2048, 'params': '4.1M'},
++    'kronos-small': {'id': 'NeoQuasar/Kronos-small', 'tok': 'NeoQuasar/Kronos-Tokenizer-base', 'ctx': 512,  'params': '24.7M'},
++    'kronos-base':  {'id': 'NeoQuasar/Kronos-base',  'tok': 'NeoQuasar/Kronos-Tokenizer-base', 'ctx': 512,  'params': '102.3M'},
++}
++
++TIMEFRAME_MAP = {
++    '1min': '1', '5min': '5', '15min': '15', '30min': '30',
++    '60min': '60', 'daily': 'daily', 'weekly': 'weekly', 'monthly': 'monthly',
+ }
+ 
+-def load_data_files():
+-    """Scan data directory and return available data files"""
+-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+-    data_files = []
+-    
+-    if os.path.exists(data_dir):
+-        for file in os.listdir(data_dir):
+-            if file.endswith(('.csv', '.feather')):
+-                file_path = os.path.join(data_dir, file)
+-                file_size = os.path.getsize(file_path)
+-                data_files.append({
+-                    'name': file,
+-                    'path': file_path,
+-                    'size': f"{file_size / 1024:.1f} KB" if file_size < 1024*1024 else f"{file_size / (1024*1024):.1f} MB"
+-                })
+-    
+-    return data_files
+-
+-def load_data_file(file_path):
+-    """Load data file"""
++# ── data fetching ─────────────────────────────────────────────────────────────
++
++def _rename(df):
++    mapping = {
++        '日期': 'timestamps', '时间': 'timestamps',
++        '开盘': 'open', '开盘价': 'open',
++        '收盘': 'close', '收盘价': 'close',
++        '最高': 'high', '最高价': 'high',
++        '最低': 'low', '最低价': 'low',
++        '成交量': 'volume', '成交额': 'amount',
++    }
++    df = df.rename(columns={k: v for k, v in mapping.items() if k in df.columns})
++    return df
++
++
++def fetch_cn_stock(symbol, period, adjust='qfq'):
++    if period in ('daily', 'weekly', 'monthly'):
++        df = ak.stock_zh_a_hist(symbol=symbol, period=period, adjust=adjust)
++    else:
++        df = ak.stock_zh_a_hist_min_em(symbol=symbol, period=period.replace('min', ''), adjust=adjust)
++    df = _rename(df)
++    df['timestamps'] = pd.to_datetime(df['timestamps'])
++    return df.sort_values('timestamps').reset_index(drop=True)
++
++
++def fetch_hk_stock(symbol, period):
++    df = ak.stock_hk_hist(symbol=symbol, period='daily' if period not in ('daily',) else period, adjust='qfq')
++    df = _rename(df)
++    df['timestamps'] = pd.to_datetime(df['timestamps'])
++    return df.sort_values('timestamps').reset_index(drop=True)
++
++
++def fetch_us_stock(symbol, period):
++    df = ak.stock_us_hist(symbol=symbol, period='daily', adjust='qfq')
++    df = _rename(df)
++    df['timestamps'] = pd.to_datetime(df['timestamps'])
++    return df.sort_values('timestamps').reset_index(drop=True)
++
++
++def fetch_crypto(symbol, period):
++    # symbol like BTC, ETH; period like daily/60min
++    coin_map = {'BTC': 'bitcoin', 'ETH': 'ethereum', 'BNB': 'binancecoin',
++                'SOL': 'solana', 'XRP': 'ripple', 'ADA': 'cardano', 'DOGE': 'dogecoin'}
++    coin_id = coin_map.get(symbol.upper(), symbol.lower())
++    df = ak.crypto_hist(symbol=coin_id, period='daily', start_date='20200101',
++                        end_date=datetime.datetime.now().strftime('%Y%m%d'))
++    df = _rename(df)
++    df['timestamps'] = pd.to_datetime(df['timestamps'])
++    return df.sort_values('timestamps').reset_index(drop=True)
++
++
++def fetch_forex(symbol, period):
++    # symbol like EURUSD, GBPUSD
++    df = ak.forex_hist(symbol=symbol)
++    df = _rename(df)
++    df['timestamps'] = pd.to_datetime(df['timestamps'])
++    return df.sort_values('timestamps').reset_index(drop=True)
++
++
++def fetch_index(symbol, period):
++    df = ak.stock_zh_index_hist(symbol=symbol, period='daily')
++    df = _rename(df)
++    df['timestamps'] = pd.to_datetime(df['timestamps'])
++    return df.sort_values('timestamps').reset_index(drop=True)
++
++
++def fetch_commodity(symbol, period):
++    # Gold, Silver, Oil via akshare futures
++    futures_map = {'GOLD': 'AU0', 'SILVER': 'AG0', 'OIL': 'SC0', 'COPPER': 'CU0'}
++    code = futures_map.get(symbol.upper(), symbol)
++    df = ak.futures_zh_daily_sina(symbol=code)
++    df = _rename(df)
++    if 'timestamps' not in df.columns and '日期' in df.columns:
++        df = df.rename(columns={'日期': 'timestamps'})
++    df['timestamps'] = pd.to_datetime(df['timestamps'])
++    return df.sort_values('timestamps').reset_index(drop=True)
++
++
++def fetch_yahoo(symbol, period):
++    """Fetch data from Yahoo Finance via yfinance or direct chart API fallback."""
++    if not YFINANCE_AVAILABLE:
++        raise RuntimeError('yfinance not installed')
++
++    mapping = {
++        '1min': '1m', '5min': '5m', '15min': '15m', '30min': '30m', '60min': '60m',
++        'daily': '1d', 'weekly': '1wk', 'monthly': '1mo'
++    }
++    interval = mapping.get(period, period)
++
++    if interval.endswith('m'):
++        yf_period = '7d' if interval == '1m' else '60d'
++    else:
++        yf_period = 'max'
++
++    df = None
+     try:
+-        if file_path.endswith('.csv'):
+-            df = pd.read_csv(file_path)
+-        elif file_path.endswith('.feather'):
+-            df = pd.read_feather(file_path)
+-        else:
+-            return None, "Unsupported file format"
+-        
+-        # Check required columns
+-        required_cols = ['open', 'high', 'low', 'close']
+-        if not all(col in df.columns for col in required_cols):
+-            return None, f"Missing required columns: {required_cols}"
+-        
+-        # Process timestamp column
+-        if 'timestamps' in df.columns:
+-            df['timestamps'] = pd.to_datetime(df['timestamps'])
+-        elif 'timestamp' in df.columns:
+-            df['timestamps'] = pd.to_datetime(df['timestamp'])
+-        elif 'date' in df.columns:
+-            # If column name is 'date', rename it to 'timestamps'
+-            df['timestamps'] = pd.to_datetime(df['date'])
++        df = yf.download(tickers=symbol, period=yf_period, interval=interval,
++                         progress=False, auto_adjust=False, threads=False)
++    except Exception as exc:
++        # allow fallback to direct API if yfinance itself fails
++        df = None
++        fallback_error = f'yfinance download failed: {exc}'
++
++    if df is None or df.empty:
++        try:
++            ticker = yf.Ticker(symbol)
++            df = ticker.history(period=yf_period, interval=interval, auto_adjust=False)
++        except Exception as exc:
++            fallback_error = f'yfinance history failed: {exc}'
++            df = None
++
++    if df is None or df.empty:
++        # try direct Yahoo chart API as a more robust fallback
++        try:
++            import requests
++            import urllib.parse
++
++            if interval.endswith('m'):
++                days = 7
++            elif interval == '1d':
++                days = 365 * 2
++            elif interval == '1wk':
++                days = 365 * 5
++            else:
++                days = 365 * 10
++
++            start = int((datetime.datetime.now() - datetime.timedelta(days=days)).timestamp())
++            end = int(datetime.datetime.now().timestamp())
++            url = (
++                f'https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}'
++                f'?period1={start}&period2={end}&interval={interval}&includePrePost=false&events=history'
++            )
++            resp = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
++            resp.raise_for_status()
++            payload = resp.json()
++            result = payload.get('chart', {}).get('result')
++            if not result:
++                raise RuntimeError(payload.get('chart', {}).get('error') or 'No chart result data')
++
++            result = result[0]
++            timestamps = result.get('timestamp') or []
++            quote = result.get('indicators', {}).get('quote', [{}])[0]
++            if not timestamps or not quote or not quote.get('open'):
++                raise RuntimeError('Yahoo chart API returned no usable quote data')
++
++            df = pd.DataFrame({
++                'timestamps': pd.to_datetime(timestamps, unit='s'),
++                'open': quote.get('open', []),
++                'high': quote.get('high', []),
++                'low': quote.get('low', []),
++                'close': quote.get('close', []),
++                'volume': quote.get('volume', []),
++            })
++        except Exception as exc:
++            raise RuntimeError(f'yfinance returned no data and Yahoo chart API fallback failed: {exc}')
++
++    if df is None or df.empty:
++        raise RuntimeError(f'yfinance returned no data for {symbol} with interval {interval}; {fallback_error if "fallback_error" in locals() else "no additional info"}')
++
++    df = df.reset_index(drop=True)
++    df = df.rename(columns={
++        'Date': 'timestamps', 'Datetime': 'timestamps',
++        'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close',
++        'Adj Close': 'adj_close', 'Volume': 'volume'
++    })
++    if 'timestamps' in df.columns:
++        df['timestamps'] = pd.to_datetime(df['timestamps'])
++
++    missing = [c for c in ['open', 'high', 'low', 'close'] if c not in df.columns]
++    if missing:
++        raise RuntimeError(f'Yahoo data missing required OHLC columns: {missing} from {list(df.columns)}')
++
++    return df.sort_values('timestamps').reset_index(drop=True)
++
++
++def get_market_data(market, symbol, period, lookback_bars):
++    """Unified data fetcher. Returns a clean DataFrame."""
++    try:
++        # support multiple market backends including yfinance
++        if market == 'yahoo':
++            df = fetch_yahoo(symbol, period)
++        elif market == 'cn_stock':
++            df = fetch_cn_stock(symbol, period)
++        elif market == 'hk_stock':
++            df = fetch_hk_stock(symbol, period)
++        elif market == 'us_stock':
++            df = fetch_us_stock(symbol, period)
++        elif market == 'crypto':
++            df = fetch_crypto(symbol, period)
++        elif market == 'forex':
++            df = fetch_forex(symbol, period)
++        elif market == 'cn_index':
++            df = fetch_index(symbol, period)
++        elif market == 'commodity':
++            df = fetch_commodity(symbol, period)
+         else:
+-            # If no timestamp column exists, create one
+-            df['timestamps'] = pd.date_range(start='2024-01-01', periods=len(df), freq='1H')
+-        
+-        # Ensure numeric columns are numeric type
+-        for col in ['open', 'high', 'low', 'close']:
+-            df[col] = pd.to_numeric(df[col], errors='coerce')
+-        
+-        # Process volume column (optional)
++            return None, f"Unknown market: {market}"
++
++        required = ['open', 'high', 'low', 'close']
++        missing = [c for c in required if c not in df.columns]
++        if missing:
++            return None, f"Missing columns: {missing}"
++
++        for c in required:
++            df[c] = pd.to_numeric(df[c], errors='coerce')
+         if 'volume' in df.columns:
+             df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+-        
+-        # Process amount column (optional, but not used for prediction)
+-        if 'amount' in df.columns:
+-            df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+-        
+-        # Remove rows containing NaN values
+-        df = df.dropna()
+-        
++        else:
++            df['volume'] = 0.0
++        if 'amount' not in df.columns:
++            df['amount'] = 0.0
++
++        df = df.dropna(subset=required).reset_index(drop=True)
++
++        if len(df) < 50:
++            return None, f"Not enough data: only {len(df)} bars"
++
+         return df, None
+-        
+     except Exception as e:
+-        return None, f"Failed to load file: {str(e)}"
++        return None, str(e)
+ 
+-def save_prediction_results(file_path, prediction_type, prediction_results, actual_data, input_data, prediction_params):
+-    """Save prediction results to file"""
+-    try:
+-        # Create prediction results directory
+-        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prediction_results')
+-        os.makedirs(results_dir, exist_ok=True)
+-        
+-        # Generate filename
+-        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+-        filename = f'prediction_{timestamp}.json'
+-        filepath = os.path.join(results_dir, filename)
+-        
+-        # Prepare data for saving
+-        save_data = {
+-            'timestamp': datetime.datetime.now().isoformat(),
+-            'file_path': file_path,
+-            'prediction_type': prediction_type,
+-            'prediction_params': prediction_params,
+-            'input_data_summary': {
+-                'rows': len(input_data),
+-                'columns': list(input_data.columns),
+-                'price_range': {
+-                    'open': {'min': float(input_data['open'].min()), 'max': float(input_data['open'].max())},
+-                    'high': {'min': float(input_data['high'].min()), 'max': float(input_data['high'].max())},
+-                    'low': {'min': float(input_data['low'].min()), 'max': float(input_data['low'].max())},
+-                    'close': {'min': float(input_data['close'].min()), 'max': float(input_data['close'].max())}
+-                },
+-                'last_values': {
+-                    'open': float(input_data['open'].iloc[-1]),
+-                    'high': float(input_data['high'].iloc[-1]),
+-                    'low': float(input_data['low'].iloc[-1]),
+-                    'close': float(input_data['close'].iloc[-1])
+-                }
+-            },
+-            'prediction_results': prediction_results,
+-            'actual_data': actual_data,
+-            'analysis': {}
+-        }
+-        
+-        # If actual data exists, perform comparison analysis
+-        if actual_data and len(actual_data) > 0:
+-            # Calculate continuity analysis
+-            if len(prediction_results) > 0 and len(actual_data) > 0:
+-                last_pred = prediction_results[0]  # First prediction point
+-            first_actual = actual_data[0]      # First actual point
+-                
+-            save_data['analysis']['continuity'] = {
+-                    'last_prediction': {
+-                        'open': last_pred['open'],
+-                        'high': last_pred['high'],
+-                        'low': last_pred['low'],
+-                        'close': last_pred['close']
+-                    },
+-                    'first_actual': {
+-                        'open': first_actual['open'],
+-                        'high': first_actual['high'],
+-                        'low': first_actual['low'],
+-                        'close': first_actual['close']
+-                    },
+-                    'gaps': {
+-                        'open_gap': abs(last_pred['open'] - first_actual['open']),
+-                        'high_gap': abs(last_pred['high'] - first_actual['high']),
+-                        'low_gap': abs(last_pred['low'] - first_actual['low']),
+-                        'close_gap': abs(last_pred['close'] - first_actual['close'])
+-                    },
+-                    'gap_percentages': {
+-                        'open_gap_pct': (abs(last_pred['open'] - first_actual['open']) / first_actual['open']) * 100,
+-                        'high_gap_pct': (abs(last_pred['high'] - first_actual['high']) / first_actual['high']) * 100,
+-                        'low_gap_pct': (abs(last_pred['low'] - first_actual['low']) / first_actual['low']) * 100,
+-                        'close_gap_pct': (abs(last_pred['close'] - first_actual['close']) / first_actual['close']) * 100
+-                    }
+-                }
+-        
+-        # Save to file
+-        with open(filepath, 'w', encoding='utf-8') as f:
+-            json.dump(save_data, f, indent=2, ensure_ascii=False)
+-        
+-        print(f"Prediction results saved to: {filepath}")
+-        return filepath
+-        
+-    except Exception as e:
+-        print(f"Failed to save prediction results: {e}")
+-        return None
+-
+-def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, historical_start_idx=0):
+-    """Create prediction chart"""
+-    # Use specified historical data start position, not always from the beginning of df
+-    if historical_start_idx + lookback + pred_len <= len(df):
+-        # Display lookback historical points + pred_len prediction points starting from specified position
+-        historical_df = df.iloc[historical_start_idx:historical_start_idx+lookback]
+-        prediction_range = range(historical_start_idx+lookback, historical_start_idx+lookback+pred_len)
+-    else:
+-        # If data is insufficient, adjust to maximum available range
+-        available_lookback = min(lookback, len(df) - historical_start_idx)
+-        available_pred_len = min(pred_len, max(0, len(df) - historical_start_idx - available_lookback))
+-        historical_df = df.iloc[historical_start_idx:historical_start_idx+available_lookback]
+-        prediction_range = range(historical_start_idx+available_lookback, historical_start_idx+available_lookback+available_pred_len)
+-    
+-    # Create chart
+-    fig = go.Figure()
+-    
+-    # Add historical data (candlestick chart)
+-    fig.add_trace(go.Candlestick(
+-        x=historical_df['timestamps'] if 'timestamps' in historical_df.columns else historical_df.index,
+-        open=historical_df['open'],
+-        high=historical_df['high'],
+-        low=historical_df['low'],
+-        close=historical_df['close'],
+-        name='Historical Data (400 data points)',
+-        increasing_line_color='#26A69A',
+-        decreasing_line_color='#EF5350'
+-    ))
+-    
+-    # Add prediction data (candlestick chart)
+-    if pred_df is not None and len(pred_df) > 0:
+-        # Calculate prediction data timestamps - ensure continuity with historical data
+-        if 'timestamps' in df.columns and len(historical_df) > 0:
+-            # Start from the last timestamp of historical data, create prediction timestamps with the same time interval
+-            last_timestamp = historical_df['timestamps'].iloc[-1]
+-            time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0] if len(df) > 1 else pd.Timedelta(hours=1)
+-            
+-            pred_timestamps = pd.date_range(
+-                start=last_timestamp + time_diff,
+-                periods=len(pred_df),
+-                freq=time_diff
+-            )
++
++# ── chart generation ──────────────────────────────────────────────────────────
++
++def _candlestick(ax, df, color_up='#26a69a', color_down='#ef5350', alpha=1.0):
++    """Draw candlesticks on ax using numeric x positions."""
++    for i, (_, row) in enumerate(df.iterrows()):
++        o, h, l, c = row['open'], row['high'], row['low'], row['close']
++        color = color_up if c >= o else color_down
++        ax.plot([i, i], [l, h], color=color, linewidth=0.8, alpha=alpha)
++        height = abs(c - o) or (h - l) * 0.01
++        rect = Rectangle((i - 0.4, min(o, c)), 0.8, height,
++                          facecolor=color, edgecolor=color, alpha=alpha)
++        ax.add_patch(rect)
++
++
++def make_chart(hist_df, pred_df, symbol, market, period, pred_len,
++               show_volume=True, show_ma=True, show_bollinger=True,
++               chart_style='dark', ma_periods=(20, 50)):
++    style_bg   = '#131722' if chart_style == 'dark' else '#ffffff'
++    style_fg   = '#d1d4dc' if chart_style == 'dark' else '#333333'
++    style_grid = '#1e222d' if chart_style == 'dark' else '#e0e0e0'
++    style_pred_bg = '#1a2332' if chart_style == 'dark' else '#f0f8ff'
++
++    rows = 2 if show_volume else 1
++    height_ratios = [3, 1] if show_volume else [1]
++
++    fig, axes = plt.subplots(rows, 1, figsize=(16, 9 if show_volume else 6),
++                             gridspec_kw={'height_ratios': height_ratios},
++                             facecolor=style_bg)
++    ax = axes[0] if show_volume else axes
++    ax_vol = axes[1] if show_volume else None
++
++    ax.set_facecolor(style_bg)
++    if ax_vol:
++        ax_vol.set_facecolor(style_bg)
++
++    n_hist = len(hist_df)
++    n_pred = len(pred_df)
++    total  = n_hist + n_pred
++
++    # shade prediction zone
++    ax.axvspan(n_hist - 0.5, total - 0.5, alpha=0.08,
++               color='#2196f3' if chart_style == 'dark' else '#bbdefb')
++
++    # historical candles
++    _candlestick(ax, hist_df)
++
++    # prediction candles (offset x by n_hist)
++    pred_df_shifted = pred_df.copy()
++    for i, (idx, row) in enumerate(pred_df.iterrows()):
++        o, h, l, c = row['open'], row['high'], row['low'], row['close']
++        xi = n_hist + i
++        color = '#66bb6a' if c >= o else '#ff7043'
++        ax.plot([xi, xi], [l, h], color=color, linewidth=0.8, alpha=0.9)
++        height = abs(c - o) or (h - l) * 0.01
++        rect = Rectangle((xi - 0.4, min(o, c)), 0.8, height,
++                          facecolor=color, edgecolor=color, alpha=0.9)
++        ax.add_patch(rect)
++
++    # moving averages on history
++    if show_ma:
++        close = hist_df['close'].values
++        for ma_p, ma_color in zip(ma_periods, ['#ff9800', '#2196f3', '#9c27b0']):
++            if len(close) >= ma_p:
++                ma = pd.Series(close).rolling(ma_p).mean().values
++                ax.plot(range(n_hist), ma, color=ma_color, linewidth=1.2,
++                        label=f'MA{ma_p}', alpha=0.85)
++
++    # Bollinger Bands
++    if show_bollinger and len(hist_df) >= 20:
++        close = hist_df['close'].values
++        mid = pd.Series(close).rolling(20).mean().values
++        std = pd.Series(close).rolling(20).std().values
++        upper, lower = mid + 2 * std, mid - 2 * std
++        x = range(n_hist)
++        ax.plot(x, upper, color='#7e57c2', linewidth=0.8, linestyle='--', alpha=0.6, label='BB Upper')
++        ax.plot(x, lower, color='#7e57c2', linewidth=0.8, linestyle='--', alpha=0.6, label='BB Lower')
++        ax.fill_between(x, lower, upper, alpha=0.04, color='#7e57c2')
++
++    # divider line
++    ax.axvline(x=n_hist - 0.5, color='#ffd700', linewidth=1.5, linestyle='--', alpha=0.8)
++    ax.text(n_hist, ax.get_ylim()[1] if ax.get_ylim()[1] != 0 else 1,
++            ' Forecast →', color='#ffd700', fontsize=9, va='top', alpha=0.9)
++
++    # x-axis ticks
++    all_ts = list(hist_df['timestamps']) + list(pred_df.index if hasattr(pred_df.index, '__iter__') else [])
++    tick_step = max(1, total // 12)
++    tick_pos   = list(range(0, total, tick_step))
++    tick_labels = []
++    for tp in tick_pos:
++        if tp < len(hist_df):
++            tick_labels.append(hist_df['timestamps'].iloc[tp].strftime('%m/%d'))
+         else:
+-            # If no timestamps, use index
+-            pred_timestamps = range(len(historical_df), len(historical_df) + len(pred_df))
+-        
+-        fig.add_trace(go.Candlestick(
+-            x=pred_timestamps,
+-            open=pred_df['open'],
+-            high=pred_df['high'],
+-            low=pred_df['low'],
+-            close=pred_df['close'],
+-            name='Prediction Data (120 data points)',
+-            increasing_line_color='#66BB6A',
+-            decreasing_line_color='#FF7043'
+-        ))
+-    
+-    # Add actual data for comparison (if exists)
+-    if actual_df is not None and len(actual_df) > 0:
+-        # Actual data should be in the same time period as prediction data
+-        if 'timestamps' in df.columns:
+-            # Actual data should use the same timestamps as prediction data to ensure time alignment
+-            if 'pred_timestamps' in locals():
+-                actual_timestamps = pred_timestamps
++            pi = tp - n_hist
++            if pi < len(pred_df) and 'timestamps' in pred_df.columns:
++                tick_labels.append(pred_df['timestamps'].iloc[pi].strftime('%m/%d'))
+             else:
+-                # If no prediction timestamps, calculate from the last timestamp of historical data
+-                if len(historical_df) > 0:
+-                    last_timestamp = historical_df['timestamps'].iloc[-1]
+-                    time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0] if len(df) > 1 else pd.Timedelta(hours=1)
+-                    actual_timestamps = pd.date_range(
+-                        start=last_timestamp + time_diff,
+-                        periods=len(actual_df),
+-                        freq=time_diff
+-                    )
+-                else:
+-                    actual_timestamps = range(len(historical_df), len(historical_df) + len(actual_df))
+-        else:
+-            actual_timestamps = range(len(historical_df), len(historical_df) + len(actual_df))
+-        
+-        fig.add_trace(go.Candlestick(
+-            x=actual_timestamps,
+-            open=actual_df['open'],
+-            high=actual_df['high'],
+-            low=actual_df['low'],
+-            close=actual_df['close'],
+-            name='Actual Data (120 data points)',
+-            increasing_line_color='#FF9800',
+-            decreasing_line_color='#F44336'
+-        ))
+-    
+-    # Update layout
+-    fig.update_layout(
+-        title='Kronos Financial Prediction Results - 400 Historical Points + 120 Prediction Points vs 120 Actual Points',
+-        xaxis_title='Time',
+-        yaxis_title='Price',
+-        template='plotly_white',
+-        height=600,
+-        showlegend=True
++                tick_labels.append(f'+{pi}')
++
++    ax.set_xticks(tick_pos)
++    ax.set_xticklabels(tick_labels, color=style_fg, fontsize=8, rotation=30)
++    ax.set_xlim(-1, total + 1)
++    ax.tick_params(colors=style_fg)
++    ax.yaxis.tick_right()
++    ax.yaxis.set_tick_params(labelcolor=style_fg, labelsize=9)
++    for spine in ax.spines.values():
++        spine.set_edgecolor(style_grid)
++    ax.grid(True, color=style_grid, linewidth=0.5, alpha=0.6)
++
++    if show_ma or show_bollinger:
++        legend = ax.legend(loc='upper left', fontsize=8, framealpha=0.3,
++                           labelcolor=style_fg, facecolor=style_bg)
++
++    # title
++    last_close = hist_df['close'].iloc[-1]
++    pred_close = pred_df['close'].iloc[-1]
++    chg = (pred_close / last_close - 1) * 100
++    chg_str = f'+{chg:.2f}%' if chg >= 0 else f'{chg:.2f}%'
++    chg_color = '#26a69a' if chg >= 0 else '#ef5350'
++    ax.set_title(
++        f'{symbol.upper()}  ·  {period}  ·  Last: {last_close:.4f}  '
++        f'Forecast end: {pred_close:.4f}  ({chg_str})',
++        color=style_fg, fontsize=11, pad=10,
++        fontweight='bold'
+     )
+-    
+-    # Ensure x-axis time continuity
+-    if 'timestamps' in historical_df.columns:
+-        # Get all timestamps and sort them
+-        all_timestamps = []
+-        if len(historical_df) > 0:
+-            all_timestamps.extend(historical_df['timestamps'])
+-        if 'pred_timestamps' in locals():
+-            all_timestamps.extend(pred_timestamps)
+-        if 'actual_timestamps' in locals():
+-            all_timestamps.extend(actual_timestamps)
+-        
+-        if all_timestamps:
+-            all_timestamps = sorted(all_timestamps)
+-            fig.update_xaxes(
+-                range=[all_timestamps[0], all_timestamps[-1]],
+-                rangeslider_visible=False,
+-                type='date'
+-            )
+-    
+-    return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
++
++    # volume
++    if show_volume and ax_vol is not None:
++        for i, (_, row) in enumerate(hist_df.iterrows()):
++            color = '#26a69a' if row['close'] >= row['open'] else '#ef5350'
++            ax_vol.bar(i, row.get('volume', 0), color=color, alpha=0.6, width=0.8)
++        for i, (_, row) in enumerate(pred_df.iterrows()):
++            ax_vol.bar(n_hist + i, row.get('volume', 0), color='#2196f3', alpha=0.5, width=0.8)
++        ax_vol.set_facecolor(style_bg)
++        ax_vol.set_xlim(-1, total + 1)
++        ax_vol.set_xticks([])
++        ax_vol.tick_params(colors=style_fg, labelsize=8)
++        ax_vol.yaxis.tick_right()
++        ax_vol.yaxis.set_tick_params(labelcolor=style_fg, labelsize=8)
++        for spine in ax_vol.spines.values():
++            spine.set_edgecolor(style_grid)
++        ax_vol.grid(True, color=style_grid, linewidth=0.5, alpha=0.4)
++        ax_vol.set_ylabel('Volume', color=style_fg, fontsize=8)
++        ax_vol.axvline(x=n_hist - 0.5, color='#ffd700', linewidth=1.5, linestyle='--', alpha=0.8)
++
++    fig.text(0.01, 0.01, 'Powered by Kronos · For research purposes only · Not financial advice',
++             color=style_fg, fontsize=7, alpha=0.5)
++
++    plt.tight_layout(pad=1.5)
++
++    buf = io.BytesIO()
++    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor=style_bg)
++    plt.close(fig)
++    buf.seek(0)
++    return base64.b64encode(buf.read()).decode('utf-8')
++
++
++# ── routes ────────────────────────────────────────────────────────────────────
+ 
+ @app.route('/')
+ def index():
+-    """Home page"""
+-    return render_template('index.html')
++    # pass available models to template so dropdown shows without JS
++    models = {}
++    for k, v in MODELS.items():
++        models[k] = {'name': k, 'params': v.get('params', ''), 'description': f"Model id: {v.get('id','')}"}
++    return render_template('index.html', models=models)
++
++
++@app.route('/api/status')
++def status():
++    return jsonify({
++        'model_available': MODEL_AVAILABLE,
++        'akshare_available': AKSHARE_AVAILABLE,
++        'model_loaded': _predictor is not None,
++        'models': {k: {'params': v['params'], 'ctx': v['ctx']} for k, v in MODELS.items()},
++    })
++
++
++@app.route('/api/available-models')
++def available_models():
++    # Return richer metadata for front-end
++    models = {}
++    for k, v in MODELS.items():
++        models[k] = {
++            'name': k,
++            'params': v.get('params', ''),
++            'description': f"Model id: {v.get('id', '')}",
++        }
++    return jsonify({'model_available': MODEL_AVAILABLE, 'models': models})
++
++
++@app.route('/api/model-status')
++def model_status():
++    if _predictor is None:
++        return jsonify({'loaded': False, 'available': MODEL_AVAILABLE})
++    # try to return basic info
++    try:
++        cur = {
++            'name': getattr(_predictor, 'name', 'kronos'),
++            'device': getattr(_predictor, 'device', 'cpu')
++        }
++    except Exception:
++        cur = {'name': 'kronos', 'device': 'cpu'}
++    return jsonify({'loaded': True, 'available': MODEL_AVAILABLE, 'current_model': cur})
++
++
++@app.route('/api/load-model', methods=['POST'])
++def load_model():
++    global _tokenizer, _model, _predictor
++    if not MODEL_AVAILABLE:
++        return jsonify({'error': 'Kronos library not installed'}), 400
++
++    data      = request.get_json()
++    # accept either 'model' or 'model_key' from frontend
++    model_key = data.get('model') or data.get('model_key') or 'kronos-small'
++    device    = data.get('device', 'cpu')
++
++    if model_key not in MODELS:
++        return jsonify({'error': f'Unknown model: {model_key}'}), 400
++
++    cfg = MODELS[model_key]
++    try:
++        _tokenizer = KronosTokenizer.from_pretrained(cfg['tok'])
++        _model     = Kronos.from_pretrained(cfg['id'])
++        _predictor = KronosPredictor(_model, _tokenizer, device=device, max_context=cfg['ctx'])
++        return jsonify({'success': True, 'message': f'{model_key} loaded on {device}'})
++    except Exception as e:
++        return jsonify({'error': str(e)}), 500
++
+ 
+ @app.route('/api/data-files')
+-def get_data_files():
+-    """Get available data file list"""
+-    data_files = load_data_files()
+-    return jsonify(data_files)
++def data_files():
++    # list CSV files in common data folders
++    roots = [
++        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'finetune_csv', 'data'),
++        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prediction_results'),
++    ]
++    files = []
++    for r in roots:
++        if os.path.isdir(r):
++            for fn in os.listdir(r):
++                if fn.lower().endswith(('.csv', '.json', '.parquet')):
++                    fp = os.path.join(r, fn)
++                    try:
++                        size = os.path.getsize(fp)
++                        files.append({'name': fn, 'path': os.path.relpath(fp, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'size': f"{size} bytes"})
++                    except Exception:
++                        files.append({'name': fn, 'path': os.path.relpath(fp, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'size': 'unknown'})
++    return jsonify(files)
++
+ 
+ @app.route('/api/load-data', methods=['POST'])
+ def load_data():
+-    """Load data file"""
++    d = request.get_json()
++    file_path = d.get('file_path')
++    if not file_path:
++        return jsonify({'error': 'file_path required'}), 400
++
++    # resolve relative path inside project
++    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++    abs_path = os.path.abspath(os.path.join(base, file_path))
++    if not abs_path.startswith(base) or not os.path.exists(abs_path):
++        return jsonify({'error': 'file not found or invalid path'}), 400
++
+     try:
+-        data = request.get_json()
+-        file_path = data.get('file_path')
+-        
+-        if not file_path:
+-            return jsonify({'error': 'File path cannot be empty'}), 400
+-        
+-        df, error = load_data_file(file_path)
+-        if error:
+-            return jsonify({'error': error}), 400
+-        
+-        # Detect data time frequency
+-        def detect_timeframe(df):
+-            if len(df) < 2:
+-                return "Unknown"
+-            
+-            time_diffs = []
+-            for i in range(1, min(10, len(df))):  # Check first 10 time differences
+-                diff = df['timestamps'].iloc[i] - df['timestamps'].iloc[i-1]
+-                time_diffs.append(diff)
+-            
+-            if not time_diffs:
+-                return "Unknown"
+-            
+-            # Calculate average time difference
+-            avg_diff = sum(time_diffs, pd.Timedelta(0)) / len(time_diffs)
+-            
+-            # Convert to readable format
+-            if avg_diff < pd.Timedelta(minutes=1):
+-                return f"{avg_diff.total_seconds():.0f} seconds"
+-            elif avg_diff < pd.Timedelta(hours=1):
+-                return f"{avg_diff.total_seconds() / 60:.0f} minutes"
+-            elif avg_diff < pd.Timedelta(days=1):
+-                return f"{avg_diff.total_seconds() / 3600:.0f} hours"
+-            else:
+-                return f"{avg_diff.days} days"
+-        
+-        # Return data information
+-        data_info = {
++        if abs_path.lower().endswith('.csv'):
++            df = pd.read_csv(abs_path)
++        elif abs_path.lower().endswith('.parquet'):
++            df = pd.read_parquet(abs_path)
++        elif abs_path.lower().endswith('.json'):
++            df = pd.read_json(abs_path)
++        else:
++            return jsonify({'error': 'unsupported file type'}), 400
++
++        df = _rename(df)
++        if 'timestamps' in df.columns:
++            df['timestamps'] = pd.to_datetime(df['timestamps'])
++
++        info = {
+             'rows': len(df),
+             'columns': list(df.columns),
+-            'start_date': df['timestamps'].min().isoformat() if 'timestamps' in df.columns else 'N/A',
+-            'end_date': df['timestamps'].max().isoformat() if 'timestamps' in df.columns else 'N/A',
+-            'price_range': {
+-                'min': float(df[['open', 'high', 'low', 'close']].min().min()),
+-                'max': float(df[['open', 'high', 'low', 'close']].max().max())
+-            },
+-            'prediction_columns': ['open', 'high', 'low', 'close'] + (['volume'] if 'volume' in df.columns else []),
+-            'timeframe': detect_timeframe(df)
++            'start_date': str(df['timestamps'].iloc[0]) if 'timestamps' in df.columns and len(df) else '',
++            'end_date': str(df['timestamps'].iloc[-1]) if 'timestamps' in df.columns and len(df) else '',
++            'price_range': {'min': float(df['close'].min()) if 'close' in df.columns else 0.0, 'max': float(df['close'].max()) if 'close' in df.columns else 0.0},
++            'timeframe': d.get('timeframe', 'unknown')
+         }
+-        
+-        return jsonify({
+-            'success': True,
+-            'data_info': data_info,
+-            'message': f'Successfully loaded data, total {len(df)} rows'
+-        })
+-        
++
++        return jsonify({'success': True, 'message': f'Loaded {os.path.basename(abs_path)}', 'data_info': info})
+     except Exception as e:
+-        return jsonify({'error': f'Failed to load data: {str(e)}'}), 500
++        return jsonify({'error': str(e)}), 500
++
++
++@app.route('/api/preview-data', methods=['POST'])
++def preview_data():
++    """Return basic info about the instrument before prediction."""
++    if not AKSHARE_AVAILABLE:
++        return jsonify({'error': 'akshare not installed'}), 400
++
++    d = request.get_json()
++    df, err = get_market_data(d['market'], d['symbol'], d['period'], 600)
++    if err:
++        return jsonify({'error': err}), 400
++
++    return jsonify({
++        'rows': len(df),
++        'start': str(df['timestamps'].iloc[0]),
++        'end':   str(df['timestamps'].iloc[-1]),
++        'last_close': float(df['close'].iloc[-1]),
++        'last_open':  float(df['open'].iloc[-1]),
++        'last_high':  float(df['high'].iloc[-1]),
++        'last_low':   float(df['low'].iloc[-1]),
++        'has_volume': bool(df['volume'].sum() > 0),
++    })
++
+ 
+ @app.route('/api/predict', methods=['POST'])
+ def predict():
+-    """Perform prediction"""
+-    try:
+-        data = request.get_json()
+-        file_path = data.get('file_path')
+-        lookback = int(data.get('lookback', 400))
+-        pred_len = int(data.get('pred_len', 120))
+-        
+-        # Get prediction quality parameters
+-        temperature = float(data.get('temperature', 1.0))
+-        top_p = float(data.get('top_p', 0.9))
+-        sample_count = int(data.get('sample_count', 1))
+-        
+-        if not file_path:
+-            return jsonify({'error': 'File path cannot be empty'}), 400
+-        
+-        # Load data
+-        df, error = load_data_file(file_path)
+-        if error:
+-            return jsonify({'error': error}), 400
+-        
+-        if len(df) < lookback:
+-            return jsonify({'error': f'Insufficient data length, need at least {lookback} rows'}), 400
+-        
+-        # Perform prediction
+-        if MODEL_AVAILABLE and predictor is not None:
+-            try:
+-                # Use real Kronos model
+-                # Only use necessary columns: OHLCV, excluding amount
+-                required_cols = ['open', 'high', 'low', 'close']
+-                if 'volume' in df.columns:
+-                    required_cols.append('volume')
+-                
+-                # Process time period selection
+-                start_date = data.get('start_date')
+-                
+-                if start_date:
+-                    # Custom time period - fix logic: use data within selected window
+-                    start_dt = pd.to_datetime(start_date)
+-                    
+-                    # Find data after start time
+-                    mask = df['timestamps'] >= start_dt
+-                    time_range_df = df[mask]
+-                    
+-                    # Ensure sufficient data: lookback + pred_len
+-                    if len(time_range_df) < lookback + pred_len:
+-                        return jsonify({'error': f'Insufficient data from start time {start_dt.strftime("%Y-%m-%d %H:%M")}, need at least {lookback + pred_len} data points, currently only {len(time_range_df)} available'}), 400
+-                    
+-                    # Use first lookback data points within selected window for prediction
+-                    x_df = time_range_df.iloc[:lookback][required_cols]
+-                    x_timestamp = time_range_df.iloc[:lookback]['timestamps']
+-                    
+-                    # Use last pred_len data points within selected window as actual values
+-                    y_timestamp = time_range_df.iloc[lookback:lookback+pred_len]['timestamps']
+-                    
+-                    # Calculate actual time period length
+-                    start_timestamp = time_range_df['timestamps'].iloc[0]
+-                    end_timestamp = time_range_df['timestamps'].iloc[lookback+pred_len-1]
+-                    time_span = end_timestamp - start_timestamp
+-                    
+-                    prediction_type = f"Kronos model prediction (within selected window: first {lookback} data points for prediction, last {pred_len} data points for comparison, time span: {time_span})"
+-                else:
+-                    # Use latest data
+-                    x_df = df.iloc[:lookback][required_cols]
+-                    x_timestamp = df.iloc[:lookback]['timestamps']
+-                    y_timestamp = df.iloc[lookback:lookback+pred_len]['timestamps']
+-                    prediction_type = "Kronos model prediction (latest data)"
+-                
+-                # Ensure timestamps are Series format, not DatetimeIndex, to avoid .dt attribute error in Kronos model
+-                if isinstance(x_timestamp, pd.DatetimeIndex):
+-                    x_timestamp = pd.Series(x_timestamp, name='timestamps')
+-                if isinstance(y_timestamp, pd.DatetimeIndex):
+-                    y_timestamp = pd.Series(y_timestamp, name='timestamps')
+-                
+-                pred_df = predictor.predict(
+-                    df=x_df,
+-                    x_timestamp=x_timestamp,
+-                    y_timestamp=y_timestamp,
+-                    pred_len=pred_len,
+-                    T=temperature,
+-                    top_p=top_p,
+-                    sample_count=sample_count
+-                )
+-                
+-            except Exception as e:
+-                return jsonify({'error': f'Kronos model prediction failed: {str(e)}'}), 500
+-        else:
+-            return jsonify({'error': 'Kronos model not loaded, please load model first'}), 400
+-        
+-        # Prepare actual data for comparison (if exists)
+-        actual_data = []
+-        actual_df = None
+-        
+-        if start_date:  # Custom time period
+-            # Fix logic: use data within selected window
+-            # Prediction uses first 400 data points within selected window
+-            # Actual data should be last 120 data points within selected window
+-            start_dt = pd.to_datetime(start_date)
+-            
+-            # Find data starting from start_date
+-            mask = df['timestamps'] >= start_dt
+-            time_range_df = df[mask]
+-            
+-            if len(time_range_df) >= lookback + pred_len:
+-                # Get last 120 data points within selected window as actual values
+-                actual_df = time_range_df.iloc[lookback:lookback+pred_len]
+-                
+-                for i, (_, row) in enumerate(actual_df.iterrows()):
+-                    actual_data.append({
+-                        'timestamp': row['timestamps'].isoformat(),
+-                        'open': float(row['open']),
+-                        'high': float(row['high']),
+-                        'low': float(row['low']),
+-                        'close': float(row['close']),
+-                        'volume': float(row['volume']) if 'volume' in row else 0,
+-                        'amount': float(row['amount']) if 'amount' in row else 0
+-                    })
+-        else:  # Latest data
+-            # Prediction uses first 400 data points
+-            # Actual data should be 120 data points after first 400 data points
+-            if len(df) >= lookback + pred_len:
+-                actual_df = df.iloc[lookback:lookback+pred_len]
+-                for i, (_, row) in enumerate(actual_df.iterrows()):
+-                    actual_data.append({
+-                        'timestamp': row['timestamps'].isoformat(),
+-                        'open': float(row['open']),
+-                        'high': float(row['high']),
+-                        'low': float(row['low']),
+-                        'close': float(row['close']),
+-                        'volume': float(row['volume']) if 'volume' in row else 0,
+-                        'amount': float(row['amount']) if 'amount' in row else 0
+-                    })
+-        
+-        # Create chart - pass historical data start position
+-        if start_date:
+-            # Custom time period: find starting position of historical data in original df
+-            start_dt = pd.to_datetime(start_date)
+-            mask = df['timestamps'] >= start_dt
+-            historical_start_idx = df[mask].index[0] if len(df[mask]) > 0 else 0
+-        else:
+-            # Latest data: start from beginning
+-            historical_start_idx = 0
+-        
+-        chart_json = create_prediction_chart(df, pred_df, lookback, pred_len, actual_df, historical_start_idx)
+-        
+-        # Prepare prediction result data - fix timestamp calculation logic
+-        if 'timestamps' in df.columns:
+-            if start_date:
+-                # Custom time period: use selected window data to calculate timestamps
+-                start_dt = pd.to_datetime(start_date)
+-                mask = df['timestamps'] >= start_dt
+-                time_range_df = df[mask]
+-                
+-                if len(time_range_df) >= lookback:
+-                    # Calculate prediction timestamps starting from last time point of selected window
+-                    last_timestamp = time_range_df['timestamps'].iloc[lookback-1]
+-                    time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0]
+-                    future_timestamps = pd.date_range(
+-                        start=last_timestamp + time_diff,
+-                        periods=pred_len,
+-                        freq=time_diff
+-                    )
+-                else:
+-                    future_timestamps = []
+-            else:
+-                # Latest data: calculate from last time point of entire data file
+-                last_timestamp = df['timestamps'].iloc[-1]
+-                time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0]
+-                future_timestamps = pd.date_range(
+-                    start=last_timestamp + time_diff,
+-                    periods=pred_len,
+-                    freq=time_diff
+-                )
++    if not MODEL_AVAILABLE:
++        return jsonify({'error': 'Kronos library not installed'}), 400
++    if _predictor is None:
++        return jsonify({'error': 'Model not loaded — click Load Model first'}), 400
++    d = request.get_json()
++
++    # allow predictions from local files or yfinance; prefer yahoo when requested
++    file_path = d.get('file_path')
++    market = d.get('market', 'cn_stock')
++
++    if not file_path:
++        # if using Yahoo, require yfinance
++        if market == 'yahoo':
++            if not YFINANCE_AVAILABLE:
++                return jsonify({'error': 'yfinance not installed'}), 400
+         else:
+-            future_timestamps = range(len(df), len(df) + pred_len)
+-        
+-        prediction_results = []
+-        for i, (_, row) in enumerate(pred_df.iterrows()):
+-            prediction_results.append({
+-                'timestamp': future_timestamps[i].isoformat() if i < len(future_timestamps) else f"T{i}",
+-                'open': float(row['open']),
+-                'high': float(row['high']),
+-                'low': float(row['low']),
+-                'close': float(row['close']),
+-                'volume': float(row['volume']) if 'volume' in row else 0,
+-                'amount': float(row['amount']) if 'amount' in row else 0
+-            })
+-        
+-        # Save prediction results to file
++            # non-yahoo backends require akshare
++            if not AKSHARE_AVAILABLE:
++                return jsonify({'error': 'akshare not installed and no file_path provided'}), 400
++    symbol      = d.get('symbol', '600580')
++    period      = d.get('period', 'daily')
++    lookback    = int(d.get('lookback', 300))
++    pred_len    = int(d.get('pred_len', 60))
++    temperature = float(d.get('temperature', 1.0))
++    top_p       = float(d.get('top_p', 0.9))
++    sample_count= int(d.get('sample_count', 1))
++    show_volume = bool(d.get('show_volume', True))
++    show_ma     = bool(d.get('show_ma', True))
++    show_bollinger = bool(d.get('show_bollinger', True))
++    chart_style = d.get('chart_style', 'dark')
++    ma_p1       = int(d.get('ma_period1', 20))
++    ma_p2       = int(d.get('ma_period2', 50))
++
++    # fetch data (from file_path or remote)
++    if file_path:
++        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++        abs_path = os.path.abspath(os.path.join(base, file_path))
++        if not abs_path.startswith(base) or not os.path.exists(abs_path):
++            return jsonify({'error': 'file not found or invalid path'}), 400
+         try:
+-            save_prediction_results(
+-                file_path=file_path,
+-                prediction_type=prediction_type,
+-                prediction_results=prediction_results,
+-                actual_data=actual_data,
+-                input_data=x_df,
+-                prediction_params={
+-                    'lookback': lookback,
+-                    'pred_len': pred_len,
+-                    'temperature': temperature,
+-                    'top_p': top_p,
+-                    'sample_count': sample_count,
+-                    'start_date': start_date if start_date else 'latest'
+-                }
+-            )
++            if abs_path.lower().endswith('.csv'):
++                df = pd.read_csv(abs_path)
++            elif abs_path.lower().endswith('.parquet'):
++                df = pd.read_parquet(abs_path)
++            elif abs_path.lower().endswith('.json'):
++                df = pd.read_json(abs_path)
++            else:
++                return jsonify({'error': 'unsupported file type'}), 400
++            df = _rename(df)
++            if 'timestamps' in df.columns:
++                df['timestamps'] = pd.to_datetime(df['timestamps'])
++            err = None
+         except Exception as e:
+-            print(f"Failed to save prediction results: {e}")
+-        
+-        return jsonify({
+-            'success': True,
+-            'prediction_type': prediction_type,
+-            'chart': chart_json,
+-            'prediction_results': prediction_results,
+-            'actual_data': actual_data,
+-            'has_comparison': len(actual_data) > 0,
+-            'message': f'Prediction completed, generated {pred_len} prediction points' + (f', including {len(actual_data)} actual data points for comparison' if len(actual_data) > 0 else '')
+-        })
+-        
+-    except Exception as e:
+-        return jsonify({'error': f'Prediction failed: {str(e)}'}), 500
++            return jsonify({'error': str(e)}), 500
++    else:
++        df, err = get_market_data(market, symbol, period, lookback + pred_len + 100)
++    if err:
++        return jsonify({'error': f'Data fetch failed: {err}'}), 400
++
++    if len(df) < lookback + 10:
++        return jsonify({'error': f'Not enough data ({len(df)} bars), reduce lookback'}), 400
++
++    lookback = min(lookback, len(df) - 10)
++
++    hist_df = df.iloc[-lookback:].copy().reset_index(drop=True)
++    x_df    = hist_df[['open', 'high', 'low', 'close', 'volume', 'amount']]
++    x_ts    = hist_df['timestamps']
++
++    # generate future timestamps
++    last_ts   = hist_df['timestamps'].iloc[-1]
++    freq_map  = {'1min': '1min', '5min': '5min', '15min': '15min', '30min': '30min',
++                 '60min': '60min', 'daily': 'B', 'weekly': 'W-FRI', 'monthly': 'MS'}
++    freq      = freq_map.get(period, 'B')
++    y_ts      = pd.date_range(start=last_ts, periods=pred_len + 1, freq=freq)[1:]
++    y_ts      = pd.Series(y_ts)
+ 
+-@app.route('/api/load-model', methods=['POST'])
+-def load_model():
+-    """Load Kronos model"""
+-    global tokenizer, model, predictor
+-    
+     try:
+-        if not MODEL_AVAILABLE:
+-            return jsonify({'error': 'Kronos model library not available'}), 400
+-        
+-        data = request.get_json()
+-        model_key = data.get('model_key', 'kronos-small')
+-        device = data.get('device', 'cpu')
+-        
+-        if model_key not in AVAILABLE_MODELS:
+-            return jsonify({'error': f'Unsupported model: {model_key}'}), 400
+-        
+-        model_config = AVAILABLE_MODELS[model_key]
+-        
+-        # Load tokenizer and model
+-        tokenizer = KronosTokenizer.from_pretrained(model_config['tokenizer_id'])
+-        model = Kronos.from_pretrained(model_config['model_id'])
+-        
+-        # Create predictor
+-        predictor = KronosPredictor(model, tokenizer, device=device, max_context=model_config['context_length'])
+-        
+-        return jsonify({
+-            'success': True,
+-            'message': f'Model loaded successfully: {model_config["name"]} ({model_config["params"]}) on {device}',
+-            'model_info': {
+-                'name': model_config['name'],
+-                'params': model_config['params'],
+-                'context_length': model_config['context_length'],
+-                'description': model_config['description']
+-            }
+-        })
+-        
++        pred_df = _predictor.predict(
++            df=x_df,
++            x_timestamp=x_ts,
++            y_timestamp=y_ts,
++            pred_len=pred_len,
++            T=temperature,
++            top_p=top_p,
++            sample_count=sample_count,
++        )
+     except Exception as e:
+-        return jsonify({'error': f'Model loading failed: {str(e)}'}), 500
++        return jsonify({'error': f'Prediction failed: {e}'}), 500
++
++    pred_df['timestamps'] = y_ts.values[:len(pred_df)]
++
++    # build chart
++    img_b64 = make_chart(
++        hist_df, pred_df, symbol, market, period, pred_len,
++        show_volume=show_volume, show_ma=show_ma, show_bollinger=show_bollinger,
++        chart_style=chart_style, ma_periods=(ma_p1, ma_p2),
++    )
++
++    last_close = float(hist_df['close'].iloc[-1])
++    pred_close = float(pred_df['close'].iloc[-1])
++    chg = (pred_close / last_close - 1) * 100
+ 
+-@app.route('/api/available-models')
+-def get_available_models():
+-    """Get available model list"""
+     return jsonify({
+-        'models': AVAILABLE_MODELS,
+-        'model_available': MODEL_AVAILABLE
++        'success': True,
++        'image': img_b64,
++        'summary': {
++            'symbol': symbol,
++            'period': period,
++            'lookback_bars': lookback,
++            'pred_bars': len(pred_df),
++            'last_close': round(last_close, 6),
++            'pred_open':  round(float(pred_df['open'].iloc[0]),  6),
++            'pred_high':  round(float(pred_df['high'].max()),    6),
++            'pred_low':   round(float(pred_df['low'].min()),     6),
++            'pred_close': round(pred_close, 6),
++            'change_pct': round(chg, 2),
++            'pred_start': str(pred_df['timestamps'].iloc[0])[:10],
++            'pred_end':   str(pred_df['timestamps'].iloc[-1])[:10],
++        }
+     })
+ 
+-@app.route('/api/model-status')
+-def get_model_status():
+-    """Get model status"""
+-    if MODEL_AVAILABLE:
+-        if predictor is not None:
+-            return jsonify({
+-                'available': True,
+-                'loaded': True,
+-                'message': 'Kronos model loaded and available',
+-                'current_model': {
+-                    'name': predictor.model.__class__.__name__,
+-                    'device': str(next(predictor.model.parameters()).device)
+-                }
+-            })
+-        else:
+-            return jsonify({
+-                'available': True,
+-                'loaded': False,
+-                'message': 'Kronos model available but not loaded'
+-            })
+-    else:
+-        return jsonify({
+-            'available': False,
+-            'loaded': False,
+-            'message': 'Kronos model library not available, please install related dependencies'
+-        })
+ 
+ if __name__ == '__main__':
+-    print("Starting Kronos Web UI...")
+-    print(f"Model availability: {MODEL_AVAILABLE}")
+-    if MODEL_AVAILABLE:
+-        print("Tip: You can load Kronos model through /api/load-model endpoint")
+-    else:
+-        print("Tip: Will use simulated data for demonstration")
+-    
+     app.run(debug=True, host='0.0.0.0', port=7070)
+diff --git a/webui/requirements.txt b/webui/requirements.txt
+index 8a47f81..6b20f74 100644
+--- a/webui/requirements.txt
++++ b/webui/requirements.txt
+@@ -5,3 +5,5 @@ numpy>=1.26.0
+ plotly==5.17.0
+ torch>=2.1.0
+ huggingface_hub==0.33.1
++yfinance==0.2.28
++requests==2.34.0
+diff --git a/webui/templates/index.html b/webui/templates/index.html
+index dd24a49..69af5a1 100644
+--- a/webui/templates/index.html
++++ b/webui/templates/index.html
+@@ -453,7 +453,12 @@
+                 <div class="form-group">
+                     <label for="model-select">Select Model:</label>
+                     <select id="model-select">
+-                        <option value="">Please load available models first</option>
++                        <option value="">Please select model</option>
++                        {% if models %}
++                        {% for key, m in models.items() %}
++                        <option value="{{ key }}">{{ m.name }} ({{ m.params }}) - {{ m.description }}</option>
++                        {% endfor %}
++                        {% endif %}
+                     </select>
+                     <small class="form-text">Select the Kronos model to use</small>
+                 </div>
+@@ -481,67 +486,39 @@
+ 
+                 <hr style="margin: 20px 0; border: 1px solid #e2e8f0;">
+ 
+-                <!-- Data File Selection -->
++                <!-- Symbol and Timeframe -->
+                 <div class="form-group">
+-                    <label for="data-file-select">Select Data File:</label>
+-                    <select id="data-file-select">
+-                        <option value="">Please load data file list first</option>
+-                    </select>
+-                    <small class="form-text">Select K-line data file from data directory</small>
+-                </div>
+-
+-                <button id="load-data-btn" class="btn btn-secondary">
+-                    📁 Load Data
+-                </button>
+-
+-                <!-- Data Information Display -->
+-                <div id="data-info" class="data-info" style="display: none;">
+-                    <h3>📊 Data Information</h3>
+-                    <p><strong>Rows:</strong> <span id="data-rows">-</span></p>
+-                    <p><strong>Columns:</strong> <span id="data-cols">-</span></p>
+-                    <p><strong>Time Range:</strong> <span id="data-time-range">-</span></p>
+-                    <p><strong>Price Range:</strong> <span id="data-price-range">-</span></p>
+-                    <p><strong>Time Frequency:</strong> <span id="data-timeframe">-</span></p>
+-                    <p><strong>Prediction Columns:</strong> <span id="data-prediction-cols">-</span></p>
++                    <label for="symbol-input">Symbol (Yahoo):</label>
++                    <input type="text" id="symbol-input" placeholder="e.g. AAPL, BTC-USD" value="AAPL">
++                    <small class="form-text">Enter the ticker symbol for Yahoo Finance</small>
+                 </div>
+ 
+-                <hr style="margin: 20px 0; border: 1px solid #e2e8f0;">
+-
+-                <!-- Time Window Selector -->
+-                <div class="time-window-container">
+-                    <h3>⏰ Time Window Selection</h3>
+-                    <div class="time-window-info">
+-                        <span id="window-start">Start: --</span>
+-                        <span id="window-end">End: --</span>
+-                        <span id="window-size">Window Size: 400+120=520 data points</span>
+-                    </div>
+-                    
+-                    <div class="time-window-slider">
+-                        <div class="slider-track">
+-                            <div class="slider-handle start-handle" id="start-handle"></div>
+-                            <div class="slider-selection" id="slider-selection"></div>
+-                            <div class="slider-handle end-handle" id="end-handle"></div>
+-                        </div>
+-                        <div class="slider-labels">
+-                            <span id="min-label">Earliest</span>
+-                            <span id="max-label">Latest</span>
+-                        </div>
+-                    </div>
+-                    
+-                    <small class="form-text">Drag slider to select time window position for 520 data points, green area represents fixed 400+120 data point range</small>
++                <div class="form-group">
++                    <label for="timeframe-select">Timeframe / Interval:</label>
++                    <select id="timeframe-select">
++                        <option value="1min">1min</option>
++                        <option value="5min">5min</option>
++                        <option value="15min">15min</option>
++                        <option value="30min">30min</option>
++                        <option value="60min">60min</option>
++                        <option value="daily" selected>daily</option>
++                        <option value="weekly">weekly</option>
++                        <option value="monthly">monthly</option>
++                    </select>
++                    <small class="form-text">Choose timeframe for Yahoo Finance</small>
+                 </div>
+ 
+                 <!-- Prediction Parameters -->
+                 <div class="form-group">
+                     <label for="lookback">Lookback Window Size:</label>
+-                    <input type="number" id="lookback" value="400" readonly>
+-                    <small class="form-text">Fixed at 400 data points</small>
++                    <input type="number" id="lookback" value="400" min="50">
++                    <small class="form-text">Number of historical bars to use</small>
+                 </div>
+ 
+                 <div class="form-group">
+                     <label for="pred-len">Prediction Length:</label>
+-                    <input type="number" id="pred-len" value="120" readonly>
+-                    <small class="form-text">Fixed at 120 data points</small>
++                    <input type="number" id="pred-len" value="120" min="1">
++                    <small class="form-text">Number of bars to predict</small>
+                 </div>
+ 
+                 <!-- Prediction Quality Parameters -->
+@@ -565,7 +542,7 @@
+                     <small class="form-text">Generate multiple prediction samples to improve quality (recommended 1-3)</small>
+                 </div>
+ 
+-                <button id="predict-btn" class="btn btn-success" disabled>
++                <button id="predict-btn" class="btn btn-success">
+                     🔮 Start Prediction
+                 </button>
+ 
+@@ -579,6 +556,9 @@
+             <div class="chart-container">
+                 <h2>📈 Prediction Results Chart</h2>
+                 <div id="chart"></div>
++                <div style="text-align:center;margin-top:12px;">
++                    <img id="result-img" style="max-width:100%;border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,0.15);display:none;" />
++                </div>
+                 
+                 <!-- Comparison Analysis -->
+                 <div id="comparison-section" class="comparison-section" style="display: none;">
+@@ -648,19 +628,13 @@
+         // Initialize application
+         async function initializeApp() {
+             console.log('🚀 Initializing Kronos Web UI...');
+-            
+-            // Load available models
++
++            // Load available models so user can load if needed
+             await loadAvailableModels();
+-            
+-            // Load data file list
+-            await loadDataFiles();
+-            
++
+             // Set up event listeners
+             setupEventListeners();
+-            
+-            // Initialize time slider
+-            initializeTimeSlider();
+-            
++
+             console.log('✅ Application initialization completed');
+         }
+ 
+@@ -682,414 +656,104 @@
+             }
+         }
+ 
+-        // Populate model selection dropdown
++        // Populate model select dropdown (merge server-rendered options with fetched ones)
+         function populateModelSelect() {
+-            const modelSelect = document.getElementById('model-select');
+-            modelSelect.innerHTML = '<option value="">Please select model</option>';
+-            
+-            Object.entries(availableModels).forEach(([key, model]) => {
+-                const option = document.createElement('option');
+-                option.value = key;
+-                option.textContent = `${model.name} (${model.params}) - ${model.description}`;
+-                modelSelect.appendChild(option);
+-            });
+-        }
+-
+-        // Load model
+-        async function loadModel() {
+-            const modelKey = document.getElementById('model-select').value;
+-            const device = document.getElementById('device-select').value;
+-            
+-            if (!modelKey) {
+-                showStatus('error', 'Please select a model to load');
+-                return;
+-            }
+-            
+             try {
+-                showLoading(true);
+-                document.getElementById('load-model-btn').disabled = true;
+-                
+-                const response = await axios.post('/api/load-model', {
+-                    model_key: modelKey,
+-                    device: device
+-                });
+-                
+-                if (response.data.success) {
+-                    modelLoaded = true;
+-                    showStatus('success', response.data.message);
+-                    updateModelStatus();
+-                    document.getElementById('predict-btn').disabled = false;
+-                    console.log('✅ Model loaded successfully:', response.data.model_info);
+-                } else {
+-                    showStatus('error', response.data.error);
++                const sel = document.getElementById('model-select');
++                // If server already rendered options, do not duplicate
++                const existing = Array.from(sel.options).map(o => o.value).filter(v => v);
++                for (const [key, m] of Object.entries(availableModels || {})) {
++                    if (existing.includes(key)) continue;
++                    const opt = document.createElement('option');
++                    opt.value = key;
++                    opt.textContent = `${m.name} (${m.params}) - ${m.description}`;
++                    sel.appendChild(opt);
+                 }
+-            } catch (error) {
+-                console.error('❌ Model loading failed:', error);
+-                showStatus('error', `Model loading failed: ${error.response?.data?.error || error.message}`);
+-            } finally {
+-                showLoading(false);
+-                document.getElementById('load-model-btn').disabled = false;
++            } catch (e) {
++                console.error('populateModelSelect error', e);
+             }
+         }
+ 
+-        // Update model status
+-        async function updateModelStatus() {
+-            try {
+-                const response = await axios.get('/api/model-status');
+-                const status = response.data;
+-                
+-                if (status.loaded) {
+-                    showStatus('success', `Model loaded: ${status.current_model.name} on ${status.current_model.device}`);
+-                } else if (status.available) {
+-                    showStatus('info', 'Model available but not loaded');
+-                } else {
+-                    showStatus('warning', 'Model library not available');
+-                }
+-            } catch (error) {
+-                console.error('❌ Failed to get model status:', error);
+-            }
+-        }
++        // Load model on user request
++        async function loadModel() {
++            const sel = document.getElementById('model-select');
++            const modelKey = sel.value;
++            const device = document.getElementById('device-select').value || 'cpu';
+ 
+-        // Load data file list
+-        async function loadDataFiles() {
+-            try {
+-                const response = await axios.get('/api/data-files');
+-                const dataFiles = response.data;
+-                
+-                const dataFileSelect = document.getElementById('data-file-select');
+-                dataFileSelect.innerHTML = '<option value="">Please select data file</option>';
+-                
+-                dataFiles.forEach(file => {
+-                    const option = document.createElement('option');
+-                    option.value = file.path;
+-                    option.textContent = `${file.name} (${file.size})`;
+-                    dataFileSelect.appendChild(option);
+-                });
+-                
+-                console.log('✅ Data file list loaded successfully:', dataFiles);
+-            } catch (error) {
+-                console.error('❌ Failed to load data file list:', error);
+-                showStatus('error', 'Failed to load data file list');
+-            }
+-        }
++            if (!modelKey) { showStatus('error', 'Please select a model to load'); return; }
+ 
+-        // Load data file
+-        async function loadData() {
+-            const filePath = document.getElementById('data-file-select').value;
+-            
+-            if (!filePath) {
+-                showStatus('error', 'Please select a data file to load');
+-                return;
+-            }
+-            
+             try {
+                 showLoading(true);
+-                document.getElementById('load-data-btn').disabled = true;
+-                
+-                const response = await axios.post('/api/load-data', {
+-                    file_path: filePath
+-                });
+-                
+-                if (response.data.success) {
+-                    currentDataFile = filePath;
+-                    currentDataInfo = response.data.data_info;
+-                    showDataInfo(response.data.data_info);
+-                    showStatus('success', response.data.message);
+-                    
+-                    // Update prediction button status
+-                    if (modelLoaded) {
+-                        document.getElementById('predict-btn').disabled = false;
+-                    }
+-                    
+-                    console.log('✅ Data loaded successfully:', response.data.data_info);
+-                } else {
+-                    showStatus('error', response.data.error);
+-                }
+-            } catch (error) {
+-                console.error('❌ Data loading failed:', error);
+-                showStatus('error', `Data loading failed: ${error.response?.data?.error || error.message}`);
+-            } finally {
+-                showLoading(false);
+-                document.getElementById('load-data-btn').disabled = false;
+-            }
+-        }
+-
+-        // Display data information
+-        function showDataInfo(dataInfo) {
+-            document.getElementById('data-info').style.display = 'block';
+-            document.getElementById('data-rows').textContent = dataInfo.rows;
+-            document.getElementById('data-cols').textContent = dataInfo.columns.length;
+-            document.getElementById('data-time-range').textContent = `${dataInfo.start_date} to ${dataInfo.end_date}`;
+-            document.getElementById('data-price-range').textContent = `${dataInfo.price_range.min.toFixed(4)} - ${dataInfo.price_range.max.toFixed(4)}`;
+-            document.getElementById('data-timeframe').textContent = dataInfo.timeframe;
+-            document.getElementById('data-prediction-cols').textContent = dataInfo.prediction_columns.join(', ');
+-            
+-            // Initialize time window slider
+-            initializeTimeWindowSlider(dataInfo);
+-        }
+-
+-                    // Time window slider related variables
+-        let sliderData = null;
+-        let isDragging = false;
+-        let currentHandle = null;
++                document.getElementById('load-model-btn').disabled = true;
++                showStatus('info', 'Loading model...');
+ 
+-        // Initialize time window slider
+-        function initializeTimeSlider() {
+-            // Set up slider event listeners
+-            setupSliderEventListeners();
+-        }
++                const payload = { model: modelKey, model_key: modelKey, device };
++                const resp = await axios.post('/api/load-model', payload);
+ 
+-        // Set up slider event listeners
+-        function setupSliderEventListeners() {
+-            const startHandle = document.getElementById('start-handle');
+-            const endHandle = document.getElementById('end-handle');
+-            const track = document.querySelector('.slider-track');
+-            
+-            // Start dragging
+-            startHandle.addEventListener('mousedown', (e) => {
+-                isDragging = true;
+-                currentHandle = 'start';
+-                e.preventDefault();
+-            });
+-            
+-            endHandle.addEventListener('mousedown', (e) => {
+-                isDragging = true;
+-                currentHandle = 'end';
+-                e.preventDefault();
+-            });
+-            
+-            // Dragging
+-            document.addEventListener('mousemove', (e) => {
+-                if (!isDragging) return;
+-                
+-                const rect = track.getBoundingClientRect();
+-                const x = e.clientX - rect.left;
+-                const percentage = Math.max(0, Math.min(1, x / rect.width));
+-                
+-                if (currentHandle === 'start') {
+-                    updateStartHandle(percentage);
+-                } else if (currentHandle === 'end') {
+-                    updateEndHandle(percentage);
+-                }
+-                
+-                updateSliderFromHandles();
+-            });
+-            
+-            // End dragging
+-            document.addEventListener('mouseup', () => {
+-                isDragging = false;
+-                currentHandle = null;
+-            });
+-            
+-            // Click track to set position directly
+-            track.addEventListener('click', (e) => {
+-                const rect = track.getBoundingClientRect();
+-                const x = e.clientX - rect.left;
+-                const percentage = Math.max(0, Math.min(1, x / rect.width));
+-                
+-                // Determine which handle is closer to the click position
+-                const startHandle = document.getElementById('start-handle');
+-                const endHandle = document.getElementById('end-handle');
+-                const startRect = startHandle.getBoundingClientRect();
+-                const endRect = endHandle.getBoundingClientRect();
+-                
+-                if (Math.abs(x - (startRect.left - rect.left)) < Math.abs(x - (endRect.left - rect.left))) {
+-                    updateStartHandle(percentage);
++                if (resp.data.success) {
++                    modelLoaded = true;
++                    document.getElementById('predict-btn').disabled = false;
++                    showStatus('success', resp.data.message || 'Model loaded');
++                    console.log('Model loaded:', resp.data);
+                 } else {
+-                    updateEndHandle(percentage);
++                    showStatus('error', resp.data.error || 'Failed to load model');
+                 }
+-                
+-                updateSliderFromHandles();
+-            });
+-        }
+-
+-        // Update start handle position
+-        function updateStartHandle(percentage) {
+-            const startHandle = document.getElementById('start-handle');
+-            const selection = document.getElementById('slider-selection');
+-            
+-            // Fixed window size of 520 data points
+-            const windowSize = 520;
+-            const totalRows = sliderData ? sliderData.totalRows : 1000;
+-            const windowPercentage = windowSize / totalRows;
+-            
+-            // Ensure start handle doesn't cause window to exceed data range
+-            if (percentage + windowPercentage > 1) {
+-                percentage = 1 - windowPercentage;
++            } catch (err) {
++                console.error('Load model failed', err);
++                showStatus('error', err.response?.data?.error || err.message || 'Load model failed');
++            } finally {
++                showLoading(false);
++                document.getElementById('load-model-btn').disabled = false;
+             }
+-            
+-            startHandle.style.left = (percentage * 100) + '%';
+-            selection.style.left = (percentage * 100) + '%';
+-            selection.style.width = (windowPercentage * 100) + '%';
+-            
+-            // Automatically adjust end handle position to maintain fixed window size
+-            const endHandle = document.getElementById('end-handle');
+-            endHandle.style.left = ((percentage + windowPercentage) * 100) + '%';
+         }
+ 
+-        // Update end handle position
+-        function updateEndHandle(percentage) {
+-            const endHandle = document.getElementById('end-handle');
+-            const selection = document.getElementById('slider-selection');
+-            
+-            // Fixed window size of 520 data points
+-            const windowSize = 520;
+-            const totalRows = sliderData ? sliderData.totalRows : 1000;
+-            const windowPercentage = windowSize / totalRows;
+-            
+-            // Ensure end handle doesn't cause window to exceed data range
+-            if (percentage - windowPercentage < 0) {
+-                percentage = windowPercentage;
+-            }
+-            
+-            endHandle.style.left = (percentage * 100) + '%';
+-            selection.style.left = ((percentage - windowPercentage) * 100) + '%';
+-            selection.style.width = (windowPercentage * 100) + '%';
+-            
+-            // Automatically adjust start handle position to maintain fixed window size
+-            const startHandle = document.getElementById('start-handle');
+-            startHandle.style.left = ((percentage - windowPercentage) * 100) + '%';
+-        }
+ 
+-        // Update slider display based on handle positions
+-        function updateSliderFromHandles() {
+-            const startHandle = document.getElementById('start-handle');
+-            const endHandle = document.getElementById('end-handle');
+-            
+-            const startPercentage = parseFloat(startHandle.style.left) / 100;
+-            const endPercentage = parseFloat(endHandle.style.left) / 100;
+-            
+-            if (!sliderData) return;
+-            
+-            // Calculate selected time range
+-            const totalTime = sliderData.endDate.getTime() - sliderData.startDate.getTime();
+-            const startTime = sliderData.startDate.getTime() + (totalTime * startPercentage);
+-            const endTime = sliderData.startDate.getTime() + (totalTime * endPercentage);
+-            
+-            const startDate = new Date(startTime);
+-            const endDate = new Date(endTime);
+-            
+-            // Update display information
+-            document.getElementById('window-start').textContent = `Start: ${startDate.toLocaleDateString()}`;
+-            document.getElementById('window-end').textContent = `End: ${endDate.toLocaleDateString()}`;
+-            
+-            // Display fixed window size
+-            document.getElementById('window-size').textContent = `Window Size: 400 + 120 = 520 data points (fixed)`;
+-            
+-            // Input field values remain fixed
+-            document.getElementById('lookback').value = 400;
+-            document.getElementById('pred-len').value = 120;
+-        }
++        // (Local file loading removed; using Yahoo symbol + timeframe instead)
+ 
+-        // Update slider based on input fields
+-        function updateSliderFromInputs() {
+-            if (!sliderData) return;
+-            
+-            // Fixed window size: 400 + 120 = 520 data points
+-            const lookback = 400;
+-            const predLen = 120;
+-            const windowSize = lookback + predLen; // Fixed at 520
+-            
+-            // Calculate slider position
+-            const totalRows = sliderData.totalRows;
+-            
+-            if (windowSize > totalRows) {
+-                // If window size exceeds total data amount, show error
+-                showStatus('error', `Insufficient data, need at least ${windowSize} data points, currently only ${totalRows} available`);
+-                return;
+-            }
+-            
+-            // Calculate slider position (default select first half of data)
+-            const startPercentage = 0.1; // Start from 10%
+-            const endPercentage = startPercentage + (windowSize / totalRows);
+-            
+-            // Update handle positions
+-            updateStartHandle(startPercentage);
+-            updateEndHandle(endPercentage);
+-            
+-            // Update display information
+-            updateSliderFromHandles();
+-        }
+-
+-        // Initialize time window slider
+-        function initializeTimeWindowSlider(dataInfo) {
+-            sliderData = {
+-                startDate: new Date(dataInfo.start_date),
+-                endDate: new Date(dataInfo.end_date),
+-                totalRows: dataInfo.rows,
+-                timeframe: dataInfo.timeframe
+-            };
+-            
+-            // Set slider labels
+-            document.getElementById('min-label').textContent = dataInfo.start_date.split('T')[0];
+-            document.getElementById('max-label').textContent = dataInfo.end_date.split('T')[0];
+-            
+-            // Initialize slider position
+-            updateSliderFromInputs();
+-        }
++                    // (Removed slider/time-window code — app uses lookback/pred_len inputs)
+ 
+-        // Start prediction
++        // Start prediction (Yahoo symbol + timeframe)
+         async function startPrediction() {
+-            if (!currentDataFile) {
+-                showStatus('error', 'Please load data file first');
+-                return;
+-            }
+-            
+-            if (!modelLoaded) {
+-                showStatus('error', 'Please load model first');
+-                return;
+-            }
+-            
++            const symbol = document.getElementById('symbol-input').value.trim();
++            if (!symbol) { showStatus('error', 'Please enter a symbol'); return; }
++
+             try {
+                 showLoading(true);
+                 document.getElementById('predict-btn').disabled = true;
+-                
+-                const lookback = parseInt(document.getElementById('lookback').value);
+-                const predLen = parseInt(document.getElementById('pred-len').value);
+-                
+-                // Get selected time range from time window slider
+-                const startHandle = document.getElementById('start-handle');
+-                const startPercentage = parseFloat(startHandle.style.left) / 100;
+-                
+-                if (!sliderData) {
+-                    showStatus('error', 'Time window slider not initialized');
+-                    return;
+-                }
+-                
+-                // Calculate selected time range
+-                const totalTime = sliderData.endDate.getTime() - sliderData.startDate.getTime();
+-                const startTime = sliderData.startDate.getTime() + (totalTime * startPercentage);
+-                const startDate = new Date(startTime);
+-                
+-                // Get prediction quality parameters
++
++                const lookback = parseInt(document.getElementById('lookback').value) || 400;
++                const predLen = parseInt(document.getElementById('pred-len').value) || 120;
++                const period = document.getElementById('timeframe-select').value || 'daily';
+                 const temperature = parseFloat(document.getElementById('temperature').value);
+                 const topP = parseFloat(document.getElementById('top-p').value);
+                 const sampleCount = parseInt(document.getElementById('sample-count').value);
+-                
+-                let predictionParams = {
+-                    file_path: currentDataFile,
++
++                const params = {
++                    market: 'yahoo',
++                    symbol: symbol,
++                    period: period,
+                     lookback: lookback,
+                     pred_len: predLen,
+-                    start_date: startDate.toISOString().slice(0, 16), // Format as YYYY-MM-DDTHH:MM
+                     temperature: temperature,
+                     top_p: topP,
+-                    sample_count: sampleCount
++                    sample_count: sampleCount,
++                    show_volume: true,
++                    show_ma: true,
++                    show_bollinger: true,
++                    chart_style: 'dark'
+                 };
+-                
+-                console.log('🚀 Starting prediction, parameters:', predictionParams);
+-                
+-                const response = await axios.post('/api/predict', predictionParams);
+-                
++
++                console.log('🚀 Predict params', params);
++                const response = await axios.post('/api/predict', params);
+                 if (response.data.success) {
+-                    // Display prediction results
+                     displayPredictionResult(response.data);
+-                    showStatus('success', response.data.message);
++                    showStatus('success', 'Prediction completed');
+                 } else {
+-                    showStatus('error', response.data.error);
++                    showStatus('error', response.data.error || 'Prediction failed');
+                 }
+-            } catch (error) {
+-                console.error('❌ Prediction failed:', error);
+-                showStatus('error', `Prediction failed: ${error.response?.data?.error || error.message}`);
++            } catch (e) {
++                console.error(e);
++                showStatus('error', e.response?.data?.error || e.message);
+             } finally {
+                 showLoading(false);
+                 document.getElementById('predict-btn').disabled = false;
+@@ -1098,16 +762,14 @@
+ 
+         // Display prediction results
+         function displayPredictionResult(result) {
+-            // Display chart
+-            const chartData = JSON.parse(result.chart);
+-            Plotly.newPlot('chart', chartData.data, chartData.layout);
+-            
+-            // Display comparison analysis (if actual data exists)
+-            if (result.has_comparison) {
+-                displayComparisonAnalysis(result);
+-            } else {
+-                document.getElementById('comparison-section').style.display = 'none';
+-            }
++            // backend returns base64 PNG in `image`
++            const img = document.getElementById('result-img');
++            img.src = 'data:image/png;base64,' + result.image;
++            img.style.display = 'block';
++            // hide plotly chart area
++            const chartDiv = document.getElementById('chart');
++            chartDiv.innerHTML = '';
++            document.getElementById('comparison-section').style.display = 'none';
+         }
+ 
+         // Display comparison analysis
+@@ -1190,10 +852,6 @@
+         function setupEventListeners() {
+             // Load model button
+             document.getElementById('load-model-btn').addEventListener('click', loadModel);
+-            
+-            // Load data button
+-            document.getElementById('load-data-btn').addEventListener('click', loadData);
+-            
+             // Prediction button
+             document.getElementById('predict-btn').addEventListener('click', startPrediction);
+             
+@@ -1206,9 +864,7 @@
+                 document.getElementById('top-p-value').textContent = this.value;
+             });
+             
+-            // Update slider when lookback window size changes
+-            document.getElementById('lookback').addEventListener('input', updateSliderFromInputs);
+-            document.getElementById('pred-len').addEventListener('input', updateSliderFromInputs);
++            // No slider — keep lookback/pred_len inputs available
+         }
+ 
+         // Display status information
+-- 
+2.53.0
+

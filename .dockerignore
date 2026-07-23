@@ -1,0 +1,25 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+venv/
+.env
+
+# Git
+.git
+.gitignore
+
+# Node
+node_modules
+
+# Misc
+__MACOSX
+*.tar.gz
+*.egg-info
+build/
+dist/
+patches/
+figures/
+data/
+tests/

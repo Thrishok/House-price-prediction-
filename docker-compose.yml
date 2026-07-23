@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  webui:
+    build:
+      context: .
+      dockerfile: webui/Dockerfile
+    ports:
+      - "7070:7070"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./:/app:cached
+    restart: unless-stopped
